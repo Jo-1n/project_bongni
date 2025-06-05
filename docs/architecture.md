@@ -37,44 +37,44 @@ Below is a high-level Mermaid flowchart of major components and data flows. You 
 flowchart TD
     subgraph Entry[ ]
         direction TB
-        A[main.py<br/>• Load config.json<br/>• Initialize TradingBot<br/>• Configure logging]
+        A[main.py\n• Load config.json\n• Initialize TradingBot\n• Configure logging]
     end
 
     subgraph Core[TradingBot]
         direction TB
-        B1[initialize()<br/>• DataHandler.update_historical_all()<br/>• Kiwoom API login (TODO)<br/>• Determine trading_day]
-        B2[fetch_realtime_ticks()<br/>• Start dummy thread or real API callback<br/>• DataHandler.update_realtime()]
-        B3[run() Loop<br/>• For each symbol →<br/>  – DataHandler.compute_indicators()<br/>  – generate_signals()<br/>  – execute_order()<br/>• RiskManager.check_daily_targets()<br/>  – On limit reached, call _final_cleanup()]
+        B1[initialize()\n• DataHandler.update_historical_all()\n• Kiwoom API login (TODO)\n• Determine trading_day]
+        B2[fetch_realtime_ticks()\n• Start dummy thread or real API callback\n• DataHandler.update_realtime()]
+        B3[run() Loop\n• For each symbol →\n  – DataHandler.compute_indicators()\n  – generate_signals()\n  – execute_order()\n• RiskManager.check_daily_targets()\n  – On limit reached, call _final_cleanup()]
     end
 
     subgraph ConfigModule[src/config.py]
         direction TB
-        C1[Config<br/>• Map config.json → Python attributes<br/>(broker credentials, symbols, risk params, indicator settings, API URLs)]
+        C1[Config\n• Map config.json → Python attributes\n(broker credentials, symbols, risk params, indicator settings, API URLs)]
     end
 
     subgraph DataModule[src/data_handler.py]
         direction TB
-        D1[DataHandler<br/>• fetch_historical(symbol)<br/>  – Load N days of 1-min OHLCV (Dummy or API)<br/>• update_historical_all()<br/>• update_realtime(symbol, tick)<br/>  – Buffer ticks, every 60 → _aggregate_to_minute_bar()<br/>• compute_indicators(symbol)<br/>  – Calculate EMA, RSI, Bollinger Bands, VWAP]
+        D1[DataHandler\n• fetch_historical(symbol)\n  – Load N days of 1-min OHLCV (Dummy or API)\n• update_historical_all()\n• update_realtime(symbol, tick)\n  – Buffer ticks, every 60 → _aggregate_to_minute_bar()\n• compute_indicators(symbol)\n  – Calculate EMA, RSI, Bollinger Bands, VWAP]
     end
 
     subgraph RiskModule[src/risk_manager.py]
         direction TB
-        R1[RiskManager<br/>• Track capital, available_cash, daily_starting_capital<br/>• can_open_position(symbol, price)<br/>  – Check position sizing, daily drawdown, cash<br/>• open_position(symbol, price, qty)<br/>  – Set SL/TP, update cash<br/>• close_position(symbol, exit_price)<br/>  – Compute P&L, update capital & cash<br/>• check_daily_targets()<br/>  – Compare return & drawdown to limits]
+        R1[RiskManager\n• Track capital, available_cash, daily_starting_capital\n• can_open_position(symbol, price)\n  – Check position sizing, daily drawdown, cash\n• open_position(symbol, price, qty)\n  – Set SL/TP, update cash\n• close_position(symbol, exit_price)\n  – Compute P&L, update capital & cash\n• check_daily_targets()\n  – Compare return & drawdown to limits]
     end
 
     subgraph Indicators[Technical Indicators]
         direction TB
-        I1[EMA, RSI, Bollinger Bands, VWAP<br/>via `ta` library]
+        I1[EMA, RSI, Bollinger Bands, VWAP\nvia `ta` library]
     end
 
     subgraph AIModel[External AI Model | REST API]
         direction TB
-        M1[AI Prediction Endpoint<br/>• Returns predicted_return<br/>• Derive ai_buy_signal / ai_sell_signal]
+        M1[AI Prediction Endpoint\n• Returns predicted_return\n• Derive ai_buy_signal / ai_sell_signal]
     end
 
     subgraph BrokerAPI[Broker API (Kiwoom OpenAPI)]
         direction TB
-        K1[send_order()<br/>• Actual BUY/SELL order submission<br/>• Return execution report (TODO)]
+        K1[send_order()\n• Actual BUY/SELL order submission\n• Return execution report (TODO)]
     end
 
     %% Connections
@@ -101,7 +101,7 @@ flowchart TD
     style Indicators fill:#fbf,stroke:#333,stroke-width:1px
     style AIModel fill:#ffe,stroke:#333,stroke-width:1px
     style BrokerAPI fill:#eef,stroke:#333,stroke-width:1px
-    ```
+```
     
 ### 2. Component Responsibilities
 
