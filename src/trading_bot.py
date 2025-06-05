@@ -1,143 +1,247 @@
 import threading
 import time
 import logging
-import requests
 from datetime import datetime
 
 import numpy as np
+import pytz
+
+from typing import Callable, Dict, List
 
 from src.data_handler import DataHandler
 from src.risk_manager import RiskManager
 from src.config import Config
-from pytz import timezone
+from src.broker_api import BrokerAPI
+from src.utils import is_nyse_open, is_nyse_close
+
+# Placeholder import for AIClient (to be implemented in ai_client.py)
+try:
+    from src.ai_client import AIClient
+except ImportError:
+    AIClient = None
+
+# Kiwoom import
+try:
+    from pykiwoom.kiwoom import Kiwoom
+except ImportError:
+    Kiwoom = None
 
 logger = logging.getLogger(__name__)
+
 
 class TradingBot:
     """
     전체 자동매매 로직을 수행하는 클래스입니다.
+
+    • Live mode: event-driven via Kiwoom.OnReceiveRealData
+    • Backtest mode: dummy tick feed + polling loop
+
+    New features per revision_config:
+      - Accepts an AIClient instance to get real predictions.
+      - Supports plugin hooks: 'before_signal' and 'after_signal'.
+      - Uses shared utils for market-open/close checks.
     """
 
-    def __init__(self, config: dict):
-        # 1) 설정 객체 생성
-        self.config = Config(config)
+    def __init__(
+        self,
+        config: Config,
+        data_handler: DataHandler,
+        risk_manager: RiskManager,
+        ai_client: "AIClient" = None
+    ):
+        self.config = config
+        self.data_handler = data_handler
+        self.risk_manager = risk_manager
+        self.ai_client = ai_client
+        self.mode = getattr(self.config, "mode", "live")
 
-        # 2) DataHandler, RiskManager 인스턴스 생성
-        self.data_handler = DataHandler(self.config)
-        self.risk_manager = RiskManager(self.config)
+        # Plugin hooks: lists of callables
+        #   before_signal(symbol: str, df: pd.DataFrame) → None
+        #   after_signal(symbol: str, signal: dict) → None
+        self.plugins: Dict[str, List[Callable]] = {
+            "before_signal": [],
+            "after_signal": []
+        }
 
-        # 3) Kiwoom API 또는 브로커 API 래퍼 초기화 (예: PyKiwoom 인스턴스)
-        # self.kiwoom = PyKiwoom(...)
-        # TODO: 실제 Kiwoom API 초기화 코드 구현
+        # Live‐mode setup
+        self.kiwoom = None
+        self.broker = None
 
-        # 4) 현재 거래일(day) 기준
+        if self.mode == "live":
+            if Kiwoom is None:
+                raise EnvironmentError(
+                    "Live mode requested but PyKiwoom is not installed."
+                )
+
+            # DataHandler must have instantiated Kiwoom
+            self.kiwoom = self.data_handler.kiwoom
+            if self.kiwoom is None:
+                raise EnvironmentError(
+                    "DataHandler was not initialized in live mode with Kiwoom."
+                )
+
+            # Attach event for real-time ticks
+            self.kiwoom.OnReceiveRealData.connect(self._on_receive_real_data)
+            logger.info("[BOT] Attached Kiwoom OnReceiveRealData handler.")
+
+            # Initialize BrokerAPI wrapper
+            self.broker = BrokerAPI(
+                kiwoom=self.kiwoom,
+                account_no=self.config.kiwoom_account
+            )
+        else:
+            logger.info("[BOT] Running in backtest mode (no Kiwoom).")
+
         self.trading_day = None
+
+    def register_plugin(self, hook_name: str, callback: Callable):
+        """
+        Register a callback for a plugin hook.
+
+        hook_name: "before_signal" or "after_signal"
+        callback: function to call with (symbol, df) or (symbol, signal_dict)
+        """
+        if hook_name not in self.plugins:
+            raise ValueError(f"Unknown hook: {hook_name}")
+        self.plugins[hook_name].append(callback)
 
     def initialize(self):
         """
-        - 과거 데이터 로드
-        - API 로그인
-        - 현재 거래일 설정
+        - Load historical data for all symbols.
+        - Set self.trading_day (NYSE date) from UTC.
         """
         self.data_handler.update_historical_all()
 
-        # Kiwoom 로그인
-        # TODO: self.kiwoom.login(self.config.kiwoom_id, self.config.kiwoom_pw, self.config.kiwoom_cert)
-        # logger.info("[API] Kiwoom 로그인 성공")
+        now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+        now_ny = now_utc.astimezone(self.config.time_zone)
+        self.trading_day = now_ny.date()
 
-        # 현재 거래일 설정 (미국 정규장 TimeZone 사용)
-        now_utc = datetime.utcnow()
-        tz = timezone(self.config.time_zone)
-        now_local = now_utc.replace(tzinfo=timezone("UTC")).astimezone(tz)
-        self.trading_day = now_local.date()
-
-        logger.info(f"[INIT] TradingBot 초기화 완료. 거래일: {self.trading_day}")
+        logger.info(f"[INIT] TradingBot initialized. Trading day (NY): {self.trading_day}")
 
     def fetch_realtime_ticks(self):
         """
-        실제 Kiwoom API의 OnReceiveRealData 콜백에서 틱 데이터를 받아
-        DataHandler.update_realtime()을 호출해야 합니다.
-        여기서는 데모용으로 랜덤 틱 데이터를 생성하는 스레드를 가동합니다.
+        In backtest mode, start a dummy tick feed thread.
+        In live mode, do nothing (Kiwoom callbacks drive ticks).
         """
+        if self.mode == "live":
+            return
+
         def _dummy_tick_feed():
             while True:
-                now = datetime.utcnow()
+                now = datetime.utcnow().replace(tzinfo=pytz.utc)
+
                 for symbol in self.config.symbols:
-                    price = np.random.random() * 100  # 예시 랜덤 가격
+                    price = np.random.random() * 100
                     volume = np.random.randint(1, 10)
                     tick = {"datetime": now, "price": price, "volume": volume}
+
                     self.data_handler.update_realtime(symbol, tick)
+
+                    # If a new minute bar just closed, generate & execute signal
+                    last_ts = self.data_handler.last_timestamp[symbol]
+                    if last_ts and last_ts == tick["datetime"].astimezone(self.config.time_zone).replace(second=0, microsecond=0):
+                        sig = self.generate_signals(symbol)
+                        if sig["signal"] != "HOLD":
+                            self.execute_order(sig, symbol)
+
                 time.sleep(1)
 
-        t = threading.Thread(target=_dummy_tick_feed, daemon=True)
-        t.start()
+        thread = threading.Thread(target=_dummy_tick_feed, daemon=True)
+        thread.start()
+        logger.info("[BACKTEST] Dummy tick feed started.")
 
     def generate_signals(self, symbol: str) -> dict:
         """
-        최신 1분봉 기준으로 매수/매도/HOLD 신호를 생성하여 반환합니다.
-        반환형 예시: {"signal": "BUY"/"SELL"/"HOLD", "price": float, "quantity": int}
+        Generate BUY / SELL / HOLD based on:
+          1) Technical indicators from DataHandler.compute_indicators()
+          2) AI prediction via self.ai_client (when available)
+          3) Weighted‐score logic as before
+
+        Also invokes plugin hooks:
+          - before_signal(symbol, df)
+          - after_signal(symbol, signal_dict)
+
+        Returns:
+          { "signal": one of ["BUY","SELL","SELL_SL","SELL_TP","HOLD"],
+            "price": float,
+            "quantity": int }
         """
         df = self.data_handler.compute_indicators(symbol)
+
+        # Plugin hook: before computing signal
+        for fn in self.plugins["before_signal"]:
+            try:
+                fn(symbol, df)
+            except Exception as e:
+                logger.warning(f"[PLUGIN][before_signal] {symbol} error: {e}")
+
+        # Not enough data → HOLD
         if df.empty or len(df) < max(
-                self.config.ema_long_period,
-                self.config.rsi_period,
-                self.config.bb_period
+            self.config.ema_long_period,
+            self.config.rsi_period,
+            self.config.bb_period
         ):
-            return {"signal": "HOLD"}
+            result = {"signal": "HOLD"}
+            for fn in self.plugins["after_signal"]:
+                try:
+                    fn(symbol, result)
+                except Exception as e:
+                    logger.warning(f"[PLUGIN][after_signal] {symbol} error: {e}")
+            return result
 
         latest = df.iloc[-1]
-        prev = df.iloc[-2]
+        prev   = df.iloc[-2]
+        price  = latest["close"]
 
-        # 1) EMA 크로스오버
-        ema_short = latest["ema_short"]
-        ema_long = latest["ema_long"]
-        prev_ema_short = prev["ema_short"]
-        prev_ema_long = prev["ema_long"]
-        ema_cross_up = (prev_ema_short < prev_ema_long) and (ema_short > ema_long)
-        ema_cross_down = (prev_ema_short > prev_ema_long) and (ema_short < ema_long)
+        # 1) EMA crossover
+        ema_cross_up   = (prev["ema_short"] < prev["ema_long"]) and (latest["ema_short"] > latest["ema_long"])
+        ema_cross_down = (prev["ema_short"] > prev["ema_long"]) and (latest["ema_short"] < latest["ema_long"])
 
-        # 2) RSI 과매수/과매도
+        # 2) RSI
         rsi = latest["rsi"]
-        rsi_oversold = rsi < self.config.rsi_oversold
+        rsi_oversold   = rsi < self.config.rsi_oversold
         rsi_overbought = rsi > self.config.rsi_overbought
 
-        # 3) Bollinger Band 돌파
-        price = latest["close"]
-        bb_hband = latest["bb_hband"]
-        bb_lband = latest["bb_lband"]
-        bb_break_up = (prev["close"] <= prev["bb_hband"]) and (price > bb_hband)
-        bb_break_down = (prev["close"] >= prev["bb_lband"]) and (price < bb_lband)
+        # 3) Bollinger Band
+        bb_break_up   = (prev["close"] <= prev["bb_hband"]) and (price > latest["bb_hband"])
+        bb_break_down = (prev["close"] >= prev["bb_lband"]) and (price < latest["bb_lband"])
 
-        # 4) VWAP 돌파
-        vwap = latest["vwap"]
-        prev_vwap = prev["vwap"]
-        vwap_break_up = (prev["close"] <= prev_vwap) and (price > vwap)
-        vwap_break_down = (prev["close"] >= prev_vwap) and (price < vwap)
+        # 4) VWAP
+        vwap_break_up   = (prev["close"] <= prev["vwap"]) and (price > latest["vwap"])
+        vwap_break_down = (prev["close"] >= prev["vwap"]) and (price < latest["vwap"])
 
-        # 5) AI 예측 신호 (실제 환경에서는 REST API 호출)
-        # 예시: response = requests.post(self.config.ai_endpoint, json={...}, headers={...})
-        #       predicted_return = response.json().get("predicted_return", 0.0)
-        predicted_return = np.random.uniform(-0.01, 0.01)
-        ai_buy_signal = (predicted_return > 0.005)
+        # 5) AI prediction
+        if self.ai_client is not None:
+            # Example: pass the last N rows as features
+            features = df.tail(self.config.ema_long_period * 2).to_dict(orient="list")
+            try:
+                predicted_return = self.ai_client.predict(symbol, features)
+            except Exception as e:
+                logger.warning(f"[AI] Prediction failed for {symbol}: {e}")
+                predicted_return = 0.0
+        else:
+            # Fallback to random stub if AIClient isn’t provided
+            predicted_return = np.random.uniform(-0.01, 0.01)
+
+        ai_buy_signal  = (predicted_return > 0.005)
         ai_sell_signal = (predicted_return < -0.005)
 
-        # 6) 신호 가중치 합산
+        # 6) Weighted score
         buy_score = 0.0
-        if ema_cross_up: buy_score += 1.0
-        if rsi_oversold: buy_score += 0.5
-        if bb_break_up: buy_score += 0.7
-        if vwap_break_up: buy_score += 0.5
-        if ai_buy_signal: buy_score += 1.0
+        if ema_cross_up:   buy_score += 1.0
+        if rsi_oversold:   buy_score += 0.5
+        if bb_break_up:    buy_score += 0.7
+        if vwap_break_up:  buy_score += 0.5
+        if ai_buy_signal:  buy_score += 1.0
 
         sell_score = 0.0
         if ema_cross_down: sell_score += 1.0
         if rsi_overbought: sell_score += 0.5
-        if bb_break_down: sell_score += 0.7
+        if bb_break_down:  sell_score += 0.7
         if vwap_break_down: sell_score += 0.5
         if ai_sell_signal: sell_score += 1.0
 
-        # 7) 임계값(Threshold)
-        BUY_THRESHOLD = 1.5
+        BUY_THRESHOLD  = 1.5
         SELL_THRESHOLD = 1.5
 
         has_position = (
@@ -145,108 +249,175 @@ class TradingBot:
             self.risk_manager.positions[symbol].is_open
         )
 
-        # 매수 신호
+        # BUY signal
+        result = {"signal": "HOLD"}
         if (buy_score >= BUY_THRESHOLD) and (not has_position) and self.risk_manager.can_open_position(symbol, price):
-            max_per_position = self.risk_manager.capital * (self.config.max_position_pct)
-            quantity = int(max_per_position // price)
-            if quantity <= 0:
-                return {"signal": "HOLD"}
-            return {"signal": "BUY", "price": price, "quantity": quantity}
+            size_info = self.risk_manager.calculate_position_size(symbol, price)
+            if size_info is not None:
+                quantity, _, _ = size_info
+                result = {"signal": "BUY", "price": price, "quantity": quantity}
 
-        # 매도(청산) 신호
-        if has_position and (sell_score >= SELL_THRESHOLD):
-            return {"signal": "SELL", "price": price, "quantity": 0}
+        # SELL signal
+        elif has_position and (sell_score >= SELL_THRESHOLD):
+            result = {"signal": "SELL", "price": price, "quantity": 0}
 
-        # 손절/익절 자동 체크
+        # Stop-loss / Take-profit override
         if has_position:
             pos = self.risk_manager.positions[symbol]
             if pos.check_stop_loss(price):
-                return {"signal": "SELL_SL", "price": price, "quantity": 0}
-            if pos.check_take_profit(price):
-                return {"signal": "SELL_TP", "price": price, "quantity": 0}
+                result = {"signal": "SELL_SL", "price": price, "quantity": 0}
+            elif pos.check_take_profit(price):
+                result = {"signal": "SELL_TP", "price": price, "quantity": 0}
 
-        return {"signal": "HOLD"}
+        # Plugin hook: after computing signal
+        for fn in self.plugins["after_signal"]:
+            try:
+                fn(symbol, result)
+            except Exception as e:
+                logger.warning(f"[PLUGIN][after_signal] {symbol} error: {e}")
+
+        return result
 
     def execute_order(self, signal: dict, symbol: str):
         """
-        generate_signals에서 반환된 시그널을 바탕으로 실제 주문을 보내거나
-        RiskManager를 통해 포지션을 관리합니다.
+        Execute a trade based on the generated signal.
+
+        • Live mode: uses BrokerAPI for real orders + RiskManager updates.
+        • Backtest mode: only RiskManager updates (no external API).
         """
         sig_type = signal.get("signal", "HOLD")
-        price = signal.get("price", 0.0)
+        price    = signal.get("price", 0.0)
         quantity = signal.get("quantity", 0)
 
         if sig_type == "BUY":
-            try:
-                # TODO: 실제 API 호출 예시
-                # order_no = self.kiwoom.send_order("신규매수", self.config.kiwoom_account, symbol, quantity, price, ...)
-                self.risk_manager.open_position(symbol, price, quantity)
-            except Exception as e:
-                logger.error(f"[ORDER][BUY] {symbol} 주문 실패: {e}")
+            if self.mode == "live":
+                try:
+                    self.broker.send_order("BUY", symbol, quantity, price, order_type="LIMIT")
+                    self.risk_manager.open_position(symbol, price)
+                except Exception as e:
+                    logger.error(f"[ORDER][BUY] {symbol} failed: {e}")
+            else:
+                try:
+                    self.risk_manager.open_position(symbol, price)
+                    logger.info(f"[BACKTEST][BUY] {symbol} qty={quantity} @ {price:.2f}")
+                except Exception as e:
+                    logger.error(f"[BACKTEST][BUY] {symbol} RiskManager failed: {e}")
 
-        elif sig_type in ["SELL", "SELL_SL", "SELL_TP"]:
-            try:
-                # TODO: 실제 API 호출 예시
-                # order_no = self.kiwoom.send_order("매도", self.config.kiwoom_account, symbol, pos.quantity, price, ...)
-                self.risk_manager.close_position(symbol, price)
-            except Exception as e:
-                logger.error(f"[ORDER][SELL] {symbol} 청산 실패: {e}")
+        elif sig_type in ("SELL", "SELL_SL", "SELL_TP"):
+            if self.mode == "live":
+                try:
+                    pos = self.risk_manager.positions.get(symbol)
+                    qty_to_sell = pos.quantity if pos else 0
+                    self.broker.send_order("SELL", symbol, qty_to_sell, price, order_type="LIMIT")
+                    self.risk_manager.close_position(symbol, price)
+                except Exception as e:
+                    logger.error(f"[ORDER][SELL] {symbol} failed: {e}")
+            else:
+                try:
+                    self.risk_manager.close_position(symbol, price)
+                    logger.info(f"[BACKTEST][SELL] {symbol} @ {price:.2f}")
+                except Exception as e:
+                    logger.error(f"[BACKTEST][SELL] {symbol} RiskManager failed: {e}")
 
-        # HOLD인 경우에는 별도 처리 없음
+        # HOLD → do nothing
 
     def run(self):
         """
-        메인 루프: 시장 개장 중이라면 주기적으로 신호를 생성하고 주문을 실행합니다.
+        Main loop:
+
+        • Live mode:
+            - Call initialize()
+            - Sleep until market close (16:00 NY), then final cleanup.
+            - All trading is driven by _on_receive_real_data.
+
+        • Backtest mode:
+            - Call initialize()
+            - Start dummy tick feed
+            - Poll every loop_interval_sec: generate signals on latest bar & execute
+            - Check daily targets; exit if hit or if market close.
+            - Final cleanup.
         """
-        # 1) 실시간 틱 피드 시작
-        self.fetch_realtime_ticks()
+        self.initialize()
 
-        while True:
-            now_utc = datetime.utcnow()
-            # 시장 개장 여부 확인
-            if not self.is_market_open(now_utc):
-                logger.info("[MARKET] 미개장 또는 장 종료 상태. 1분 후 재확인")
-                time.sleep(60)
-                continue
+        if self.mode == "live":
+            logger.info("[BOT] Live mode: awaiting real-time ticks...")
+            while True:
+                now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+                if is_nyse_close(now_utc, self.config.time_zone):
+                    logger.info("[MARKET] Market closed. Starting final cleanup.")
+                    break
+                time.sleep(30)
+            self._final_cleanup()
 
-            # 각 종목별로 신호 생성 및 주문 실행
-            for symbol in self.config.symbols:
-                df = self.data_handler.historical_data[symbol]
-                if df.empty:
-                    continue
-                signal = self.generate_signals(symbol)
-                if signal["signal"] != "HOLD":
-                    self.execute_order(signal, symbol)
+        else:
+            logger.info("[BOT] Backtest mode: starting dummy tick feed.")
+            self.fetch_realtime_ticks()
+            while True:
+                now_utc = datetime.utcnow().replace(tzinfo=pytz.utc)
+                if is_nyse_close(now_utc, self.config.time_zone):
+                    logger.info("[BACKTEST] Market closed. Starting final cleanup.")
+                    break
 
-            # 일별 목표 달성 또는 손실 한도 도달 여부 확인
-            if not self.risk_manager.check_daily_targets():
-                logger.info("[BOT] 목표달성/손실한도 도달: 신규 진입 중지 및 루프 종료")
-                break
+                for symbol in self.config.symbols:
+                    df = self.data_handler.historical_data[symbol]
+                    if df.empty:
+                        continue
+                    sig = self.generate_signals(symbol)
+                    if sig["signal"] != "HOLD":
+                        self.execute_order(sig, symbol)
 
-            time.sleep(self.config.loop_interval_sec)
+                if not self.risk_manager.check_daily_targets():
+                    logger.info("[BACKTEST] Daily target/loss reached. Exiting loop.")
+                    break
 
-        # 시장 폐장 전 남은 포지션 청산
-        self._final_cleanup()
+                time.sleep(self.config.loop_interval_sec)
 
-    def is_market_open(self, now_utc: datetime) -> bool:
+            self._final_cleanup()
+
+    def _on_receive_real_data(self, sRealType, sRealData):
         """
-        현재 UTC 시간을 기반으로 미국 정규장 개폐 여부를 판단합니다.
-        (정확한 시간 계산을 위해 pytz를 사용하여 타임존 변환 필요)
+        Kiwoom calls this whenever a subscribed real‐time event arrives.
+        sRealType: the real‐time type code (e.g., “주식체결” for tick)
+        sRealData: dict or raw data containing fields like 체결시간, 현재가, 거래량, 종목코드.
         """
-        # 간략화: UTC 기준 14:30~21:00 사이를 개장으로 가정
-        hour = now_utc.hour
-        minute = now_utc.minute
-        if (hour == 14 and minute >= 30) or (14 < hour < 21) or (hour == 21 and minute == 0):
-            return True
-        return False
+        if sRealType != "주식체결":
+            return
+
+        # Extract symbol, time, price, volume
+        symbol = sRealData["종목코드"]
+        date_str = datetime.now(pytz.utc).astimezone(self.config.time_zone).strftime("%Y%m%d")
+        time_str = sRealData["체결시간"]  # e.g., "093012"
+        # parse into NY‐tz datetime
+        dt_naive = datetime.strptime(date_str + time_str, "%Y%m%d%H%M%S")
+        dt_ny = self.config.time_zone.localize(dt_naive)
+        price = float(sRealData["현재가"])
+        volume = int(sRealData["거래량"])
+
+        tick = {"datetime": dt_ny, "price": price, "volume": volume}
+        self.data_handler.update_realtime(symbol, tick)
+
+        # If that tick closed a new 1-min bar, generate & execute
+        last_ts = self.data_handler.last_timestamp[symbol]
+        if last_ts and last_ts == tick["datetime"].replace(second=0, microsecond=0):
+            sig = self.generate_signals(symbol)
+            if sig["signal"] != "HOLD":
+                self.execute_order(sig, symbol)
 
     def _final_cleanup(self):
         """
-        시장 폐장 직전에 남은 포지션을 모두 청산합니다.
+        At market close, liquidate all open positions.
         """
-        logger.info("[CLEANUP] 시장 폐장 전 모든 포지션 청산 중...")
+        logger.info("[CLEANUP] Liquidating all open positions...")
         for symbol, pos in list(self.risk_manager.positions.items()):
             if pos.is_open:
-                last_price = self.data_handler.historical_data[symbol]["close"].iloc[-1]
-                self.risk_manager.close_position(symbol, last_price)
-        logger.info("[CLEANUP] 모든 포지션이 청산되었습니다.")
+                df = self.data_handler.historical_data[symbol]
+                last_price = df["close"].iloc[-1] if not df.empty else 0.0
+                try:
+                    if self.mode == "live":
+                        qty_to_sell = pos.quantity
+                        self.broker.send_order("SELL", symbol, qty_to_sell, last_price, order_type="LIMIT")
+                    self.risk_manager.close_position(symbol, last_price)
+                    logger.info(f"[CLEANUP] {symbol} closed @ {last_price:.2f}")
+                except Exception as e:
+                    logger.error(f"[CLEANUP] Failed to close {symbol}: {e}")
+        logger.info("[CLEANUP] All positions liquidated.")

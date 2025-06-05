@@ -1,20 +1,34 @@
 import logging
+from typing import Dict, List, Optional
+from datetime import datetime
+
+import pandas as pd
 
 from src.config import Config
 
 logger = logging.getLogger(__name__)
 
+
 class Position:
     """
-    개별 종목 포지션 정보를 저장하고, 손절/익절 여부를 판단합니다.
+    Stores information about an individual position and checks for stop-loss / take-profit.
     """
-    def __init__(self, symbol: str, entry_price: float, quantity: int,
-                 stop_loss_price: float, take_profit_price: float):
+
+    def __init__(
+        self,
+        symbol: str,
+        entry_price: float,
+        quantity: int,
+        stop_loss_price: float,
+        take_profit_price: float,
+        entry_time: datetime,
+    ):
         self.symbol = symbol
         self.entry_price = entry_price
         self.quantity = quantity
         self.stop_loss_price = stop_loss_price
         self.take_profit_price = take_profit_price
+        self.entry_time = entry_time
         self.is_open = True
 
     def check_stop_loss(self, current_price: float) -> bool:
@@ -26,113 +40,273 @@ class Position:
 
 class RiskManager:
     """
-    계좌 전체 자본, 가용 현금, 보유 포지션, 일별손익 등을 관리합니다.
+    Manages account equity, available cash, open positions, and daily P&L.
+
+    Key features:
+      - Volatility‐adjusted position sizing (ATR‐based, fallback to percent‐based).
+      - Dynamic stop-loss / take-profit (ATR‐based multipliers, fallback to config percentages).
+      - Tracks trade_history for each closed trade.
+      - Computes equity curve & drawdown from trade_history.
+      - Enforces daily target return and daily max drawdown.
     """
+
     def __init__(self, config: Config):
         self.config = config
 
-        # 초기 자본
+        # 1) Initial capital and available cash
         self.capital = self.config.initial_capital
         self.available_cash = self.config.initial_capital
-        # 종목별 포지션 사전: {symbol: Position}
-        self.positions = {}
-        # 일별 시작 자본(리셋 시점 기준)
+
+        # 2) Currently open positions: {symbol: Position}
+        self.positions: Dict[str, Position] = {}
+
+        # 3) List of closed trade records (for equity curve)
+        self.trade_history: List[dict] = []
+
+        # 4) Daily starting capital (reset at start of each trading day)
         self.daily_starting_capital = self.config.initial_capital
+
+    def _get_latest_atr(self, symbol: str) -> Optional[float]:
+        """
+        Retrieves the most recent ATR from DataHandler.historical_data[symbol]['atr'].
+        Returns None if ATR is unavailable or the DataFrame is empty.
+        """
+        dh = getattr(self.config, "_data_handler_ref", None)
+        if dh is None:
+            return None
+
+        df = dh.historical_data.get(symbol)
+        if df is None or df.empty or "atr" not in df.columns:
+            return None
+
+        return df["atr"].iloc[-1]
+
+    def calculate_position_size(self, symbol: str, price: float) -> Optional[tuple]:
+        """
+        Determines position size (quantity, stop-loss, take-profit) using ATR or percent-based sizing.
+
+        ATR-based sizing (if ATR is available):
+          - dollar_risk_per_share = ATR × atr_stop_multiplier
+          - max_risk_per_trade = capital × max_position_pct
+          - qty = floor(max_risk_per_trade / dollar_risk_per_share)
+          - SL = price − ATR × atr_stop_multiplier
+          - TP = price + ATR × atr_take_multiplier
+
+        If ATR is not available, fallback to percent-based sizing:
+          - max_value = capital × max_position_pct
+          - qty = floor(max_value / price)
+          - SL = price × (1 − stop_loss_pct/100)
+          - TP = price × (1 + take_profit_pct/100)
+
+        Returns (qty, sl_price, tp_price) or None if:
+          - Required cash > available_cash, or
+          - qty < 1.
+        """
+        atr = self._get_latest_atr(symbol)
+        if atr is not None and atr > 0:
+            atr_stop_mult = getattr(self.config, "atr_stop_multiplier", 1.0)
+            atr_take_mult = getattr(self.config, "atr_take_multiplier", 2.0)
+
+            dollar_risk_per_share = atr * atr_stop_mult
+            max_risk_per_trade = self.capital * self.config.max_position_pct
+
+            if dollar_risk_per_share <= 0:
+                logger.warning(f"[RISK] Invalid ATR ({atr}) for {symbol}.")
+                return None
+
+            qty = int(max_risk_per_trade // dollar_risk_per_share)
+            if qty < 1:
+                logger.warning(
+                    f"[RISK] {symbol}: ATR-based quantity < 1 (ATR={atr:.2f})."
+                )
+                return None
+
+            required_cash = price * qty
+            if required_cash > self.available_cash:
+                logger.warning(
+                    f"[RISK] {symbol}: Required cash ({required_cash:.2f}) > available cash ({self.available_cash:.2f})."
+                )
+                return None
+
+            sl_price = price - atr * atr_stop_mult
+            tp_price = price + atr * atr_take_mult
+            return qty, sl_price, tp_price
+
+        # Fallback to percent-based sizing
+        max_value = self.capital * self.config.max_position_pct
+        qty = int(max_value // price)
+        if qty < 1:
+            logger.warning(f"[RISK] {symbol}: Percent-based quantity < 1.")
+            return None
+
+        required_cash = price * qty
+        if required_cash > self.available_cash:
+            logger.warning(
+                f"[RISK] {symbol}: Required cash ({required_cash:.2f}) > available cash ({self.available_cash:.2f})."
+            )
+            return None
+
+        sl_price = price * (1.0 - self.config.stop_loss_pct / 100.0)
+        tp_price = price * (1.0 + self.config.take_profit_pct / 100.0)
+        return qty, sl_price, tp_price
 
     def can_open_position(self, symbol: str, price: float) -> bool:
         """
-        새로운 포지션 진입 가능 여부 판단:
-        1) 포지션당 최대 자본 비중 이하인지
-        2) 일별 누적 손실 한도 미달인지
-        3) 가용 현금이 충분한지
+        Determines if a new position can be opened:
+          1) calculate_position_size() returns valid sizing.
+          2) Position value ≤ capital × max_position_pct.
+          3) Current drawdown < daily_max_loss_pct.
         """
-        invested = sum(
-            pos.entry_price * pos.quantity
-            for pos in self.positions.values() if pos.is_open
-        )
-        max_per_position = self.capital * self.config.max_position_pct
-        required_cash = price * 1  # 우선 1주 매수 기준
+        size_info = self.calculate_position_size(symbol, price)
+        if size_info is None:
+            return False
 
-        if required_cash > max_per_position:
+        qty, sl_price, tp_price = size_info
+        position_value = price * qty
+        max_value = self.capital * self.config.max_position_pct
+        if position_value > max_value:
             logger.warning(
-                f"[RISK] {symbol} 진입 불가: 1주 매수금액({required_cash:.2f})이 "
-                f"최대 포지션 한도({max_per_position:.2f}) 초과"
+                f"[RISK] {symbol}: Position value {position_value:.2f} > max {max_value:.2f}."
             )
             return False
 
-        current_drawdown = (self.daily_starting_capital - self.capital) / self.daily_starting_capital
+        current_drawdown = self.get_current_drawdown()
         if current_drawdown >= (self.config.daily_max_loss_pct / 100.0):
             logger.warning(
-                f"[RISK] 일 누적 손실 한도({self.config.daily_max_loss_pct}%) 도달: "
-                "추가 진입 금지"
-            )
-            return False
-
-        if required_cash > self.available_cash:
-            logger.warning(
-                f"[RISK] {symbol} 진입 불가: 가용 현금({self.available_cash:.2f}) 부족"
+                f"[RISK] {symbol}: Current drawdown {current_drawdown*100:.2f}% ≥ daily max {self.config.daily_max_loss_pct}%."
             )
             return False
 
         return True
 
-    def open_position(self, symbol: str, price: float, quantity: int):
+    def open_position(self, symbol: str, price: float):
         """
-        새로운 포지션을 열고 Position 객체를 생성하여 self.positions에 저장.
-        청산 가격(손절가, 익절가)은 파라미터 기반으로 계산합니다.
+        Opens a new position for 'symbol' at 'price':
+          - Calls calculate_position_size to get (qty, sl_price, tp_price).
+          - Deducts cash and stores a Position object.
         """
-        sl_price = price * (1 - self.config.stop_loss_pct / 100.0)
-        tp_price = price * (1 + self.config.take_profit_pct / 100.0)
+        size_info = self.calculate_position_size(symbol, price)
+        if size_info is None:
+            return
 
-        pos = Position(symbol, entry_price=price, quantity=quantity,
-                       stop_loss_price=sl_price, take_profit_price=tp_price)
+        qty, sl_price, tp_price = size_info
+        entry_time = datetime.utcnow()
+
+        pos = Position(
+            symbol=symbol,
+            entry_price=price,
+            quantity=qty,
+            stop_loss_price=sl_price,
+            take_profit_price=tp_price,
+            entry_time=entry_time,
+        )
         self.positions[symbol] = pos
 
-        invested = price * quantity
+        invested = price * qty
         self.available_cash -= invested
+
         logger.info(
-            f"[RISK] {symbol} 포지션 진입: 진입가={price:.2f}, 수량={quantity}, "
-            f"SL={sl_price:.2f}, TP={tp_price:.2f}"
+            f"[RISK] Opened {symbol}: qty={qty}, entry={price:.2f}, SL={sl_price:.2f}, "
+            f"TP={tp_price:.2f}, cash_left={self.available_cash:.2f}"
         )
 
     def close_position(self, symbol: str, exit_price: float):
         """
-        포지션을 청산하고 계좌 자본 및 가용 현금을 업데이트합니다.
+        Closes an existing position for 'symbol' at 'exit_price':
+          - Calculates profit = (exit_price − entry_price) × quantity.
+          - Updates capital & available_cash.
+          - Records the trade in trade_history.
         """
         pos = self.positions.get(symbol)
         if not pos or not pos.is_open:
             return
 
+        exit_time = datetime.utcnow()
         profit = (exit_price - pos.entry_price) * pos.quantity
+
+        # Update account equity
         self.capital += profit
         self.available_cash += exit_price * pos.quantity
         pos.is_open = False
 
+        # Record trade
+        equity_after = self.capital
+        trade_record = {
+            "symbol":       symbol,
+            "entry_time":   pos.entry_time,
+            "exit_time":    exit_time,
+            "entry_price":  pos.entry_price,
+            "exit_price":   exit_price,
+            "quantity":     pos.quantity,
+            "pnl":          profit,
+            "equity_after": equity_after,
+        }
+        self.trade_history.append(trade_record)
+
         logger.info(
-            f"[RISK] {symbol} 포지션 청산: 청산가={exit_price:.2f}, "
-            f"수익={profit:.2f}, 잔여 자본={self.capital:.2f}"
+            f"[RISK] Closed {symbol}: exit={exit_price:.2f}, qty={pos.quantity}, "
+            f"PnL={profit:.2f}, equity={self.capital:.2f}"
         )
+
+    def get_equity_curve(self) -> pd.DataFrame:
+        """
+        Returns a DataFrame of equity over time based on trade_history.
+        Columns: ['timestamp','equity'].
+        - First row: daily_starting_capital at the entry_time of the first trade (if any).
+        """
+        if not self.trade_history:
+            return pd.DataFrame(
+                [{"timestamp": datetime.utcnow(), "equity": self.daily_starting_capital}]
+            )
+
+        records = []
+        first_entry = self.trade_history[0]["entry_time"]
+        records.append({"timestamp": first_entry, "equity": self.daily_starting_capital})
+
+        for trade in self.trade_history:
+            records.append({
+                "timestamp": trade["exit_time"],
+                "equity":    trade["equity_after"],
+            })
+
+        df_eq = pd.DataFrame(records)
+        df_eq = df_eq.sort_values("timestamp").reset_index(drop=True)
+        return df_eq
+
+    def get_current_drawdown(self) -> float:
+        """
+        Computes the current peak-to-trough drawdown from the equity curve.
+        Returns a decimal (e.g., 0.05 for 5% drawdown).
+        """
+        df_eq = self.get_equity_curve()
+        if df_eq.empty:
+            return 0.0
+
+        equities = df_eq["equity"].values
+        peaks = pd.Series(equities).cummax().values
+        drawdowns = (peaks - equities) / peaks
+        return float(drawdowns.max())
 
     def check_daily_targets(self) -> bool:
         """
-        일별 목표 수익률 달성 및 일별 최대 손실 한도 미달 여부를 확인합니다.
-        - 목표 수익 달성 시: False 반환(더 이상 진입 금지)
-        - 손실 한도 도달 시: False 반환(더 이상 진입 금지)
-        - 그 외: True 반환
+        Checks daily target return and daily max drawdown:
+          - If current return ≥ target_daily_return_pct/100 → return False (stop trading)
+          - If current drawdown ≥ daily_max_loss_pct/100 → return False (stop trading)
+          - Otherwise, return True (continue trading)
         """
-        current_return = (self.capital - self.daily_starting_capital) / self.daily_starting_capital
+        current_equity = self.capital
+        current_return = (current_equity - self.daily_starting_capital) / self.daily_starting_capital
+
         if current_return >= (self.config.target_daily_return_pct / 100.0):
             logger.info(
-                f"[RISK] 일별 목표 수익률({self.config.target_daily_return_pct}%) 달성: "
-                "추가 진입 금지"
+                f"[RISK] Daily target reached: {current_return*100:.2f}% ≥ {self.config.target_daily_return_pct}%."
             )
             return False
 
-        current_drawdown = (self.daily_starting_capital - self.capital) / self.daily_starting_capital
-        if current_drawdown >= (self.config.daily_max_loss_pct / 100.0):
+        current_dd = self.get_current_drawdown()
+        if current_dd >= (self.config.daily_max_loss_pct / 100.0):
             logger.info(
-                f"[RISK] 일 누적 손실 한도({self.config.daily_max_loss_pct}%) 도달: "
-                "추가 진입 금지"
+                f"[RISK] Daily drawdown reached: {current_dd*100:.2f}% ≥ {self.config.daily_max_loss_pct}%."
             )
             return False
 
