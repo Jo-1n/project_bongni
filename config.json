@@ -1,0 +1,39 @@
+{
+  "kiwoom": {
+    "user_id": "YOUR_KIWOOM_ID",
+    "user_pw": "YOUR_KIWOOM_PW",
+    "cert_pw": "YOUR_KIWOOM_CERT_PW",
+    "account_no": "1234567890"
+  },
+  "ai_model": {
+    "endpoint_url": "https://api.your-ai-provider.com/predict",
+    "api_key": "YOUR_AI_API_KEY"
+  },
+
+  "symbols": ["AAPL", "MSFT", "GOOGL", "TSLA"],
+  "time_zone": "America/New_York",
+
+  "initial_capital": 1000.0,
+  "max_position_pct": 0.5,
+  "target_daily_return_pct": 2.0,
+  "stop_loss_pct": 1.0,
+  "take_profit_pct": 1.5,
+  "daily_max_loss_pct": 3.0,
+
+  "ema_short_period": 5,
+  "ema_long_period": 10,
+  "rsi_period": 14,
+  "rsi_oversold": 30,
+  "rsi_overbought": 70,
+  "bb_period": 20,
+  "bb_std_dev": 2,
+
+  "historical_lookback_days": 30,
+  "historical_bar_period": "1min",
+
+  "order_retry_interval_sec": 1.0,
+  "loop_interval_sec": 5.0,
+
+  "log_level": "INFO",
+  "log_file": "logs/bot.log"
+}
