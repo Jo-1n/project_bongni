@@ -39,8 +39,8 @@ For detailed setup instructions, please see the [Prerequisites section in the Us
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/yourusername/trading-bot.git
-    cd trading-bot
+    git clone https://github.com/Jo-1n/project_bongni.git
+    cd project_bongni
     ```
 2.  **Create a virtual environment and install dependencies:**
     ```bash
