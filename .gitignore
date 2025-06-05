@@ -177,6 +177,9 @@ logs/
 data/historical/
 data/realtime/
 
+# macOS
+.DS_Store
+
 # Ignore user-specific settings and local config secrets
 *.env
 config.local.json
