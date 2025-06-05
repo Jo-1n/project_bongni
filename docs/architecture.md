@@ -1,390 +1,559 @@
-# System Architecture
+TradingBot System: AI-Optimized Architecture Specification
 
-This document describes the overall architecture of the **Automatic Trading Bot** project. It covers component responsibilities, data flows, module interactions, and deployment considerations.
+This document is designed for AI agents (e.g., LLMs, code interpreters, refactoring tools) to understand, modify, and extend the Automatic Trading Bot architecture. It provides:
+	•	Intent & Objectives (machine-readable)
+	•	Module Interfaces (function signatures, data types)
+	•	Data Schemas (JSON, Python types)
+	•	Control Flow (pseudocode blocks)
+	•	Integration Contracts (AI Model, Broker API)
+	•	Configuration Schema (config.json structure)
+	•	Extension Points (hooks, TODOs)
 
-------------------------------------------------------------------------
+⸻
 
-## 1. System Overview
+1. SYSTEM INTENT (Machine-Readable)
 
-The Automatic Trading Bot is designed to:
+{
+  "system_name": "Automatic Trading Bot",
+  "purpose": "Fully automated intraday trading using hybrid technical+AI signals.",
+  "input": {
+    "tick_data": {"type": "object", "properties": {
+      "datetime": "ISO8601 string",
+      "symbol": "string",
+      "price": "float",
+      "volume": "int"
+    }},
+    "config": {"$ref": "#/components/schemas/ConfigJSON"}
+  },
+  "output": {
+    "orders": {"type": "array", "items": {"$ref": "#/components/schemas/Order"}},
+    "logs": "text entries with timestamps",
+    "metrics": {"type": "object", "properties": {
+      "capital": "float", "available_cash": "float", "positions": "object"
+    }}
+  },
+  "modes": ["live", "backtest"],
+  "frequency": {"tick_resolution": "1s", "bar_resolution": "1m"}
+}
 
-1.  Collect real-time tick data (per-second price + volume) for a configurable list of symbols.
-2.  Aggregate ticks into 1-minute bars (OHLCV) and compute technical indicators (EMA, RSI, Bollinger Bands, VWAP).
-3.  Generate intraday buy/sell signals based on a hybrid of technical rules and AI model predictions.
-4.  Execute orders via Kiwoom OpenAPI (or equivalent broker API), enforcing stop-loss, take-profit, and daily risk limits.
-5.  Provide comprehensive logging, backtesting support, and convenient configuration management.
 
-Below is a high-level ASCII diagram of major components and data flows: 
-# System Architecture
+⸻
 
-This document describes the overall architecture of the **Automatic Trading Bot** project. It covers component responsibilities, data flows, module interactions, and deployment considerations.
+2. CONFIGURATION SCHEMA (config.json)
 
----
+JSON Schema (Draft 07)
 
-## 1. System Overview
-
-The Automatic Trading Bot is designed to:
-
-1. Collect real-time tick data (per-second price + volume) for a configurable list of symbols.
-2. Aggregate ticks into 1-minute bars (OHLCV) and compute technical indicators (EMA, RSI, Bollinger Bands, VWAP).
-3. Generate intraday buy/sell signals based on a hybrid of technical rules and AI model predictions.
-4. Execute orders via Kiwoom OpenAPI (or equivalent broker API), enforcing stop-loss, take-profit, and daily risk limits.
-5. Provide comprehensive logging, backtesting support, and convenient configuration management.
-
-Below is a high-level Mermaid flowchart of major components and data flows. You can paste this directly into any Markdown environment that supports Mermaid to render a diagram.
-
-```mermaid
-flowchart TD
-    subgraph Entry[ ]
-        direction TB
-        A[main.py\n- Load config.json\n- Initialize TradingBot\n- Configure logging]
-    end
-
-    subgraph Core[TradingBot]
-        direction TB
-        B1[initialize()\n- update_historical_all()\n- Kiwoom API login (TODO)\n- Determine trading_day]
-        B2[fetch_realtime_ticks()\n- Start dummy thread or real API callback\n- update_realtime()]
-        B3[run() Loop\n- For each symbol:\n  - compute_indicators()\n  - generate_signals()\n  - execute_order()\n- check_daily_targets()\n  - If limit reached: _final_cleanup()]
-    end
-
-    subgraph ConfigModule[src/config.py]
-        direction TB
-        C1[Config\n- Parse config.json\n- Set broker credentials, symbols, risk params, indicator settings, API URLs]
-    end
-
-    subgraph DataModule[src/data_handler.py]
-        direction TB
-        D1[DataHandler\n- fetch_historical(symbol)\n- update_historical_all()\n- update_realtime(symbol, tick)\n- compute_indicators(symbol)]
-    end
-
-    subgraph RiskModule[src/risk_manager.py]
-        direction TB
-        R1[RiskManager\n- Track capital, available cash\n- can_open_position(symbol, price)\n- open_position(symbol, price, qty)\n- close_position(symbol, exit_price)\n- check_daily_targets()]
-    end
-
-    subgraph Indicators[Technical Indicators]
-        direction TB
-        I1[EMA, RSI, Bollinger Bands, VWAP\n(via ta-lib)]
-    end
-
-    subgraph AIModel[External AI Model | REST API]
-        direction TB
-        M1[AI Prediction Endpoint\n- Return predicted_return\n- Derive buy/sell signal]
-    end
-
-    subgraph BrokerAPI[Broker API (Kiwoom OpenAPI)]
-        direction TB
-        K1[send_order()\n- Submit BUY/SELL order\n- Return execution report (TODO)]
-    end
-
-    %% Connections
-    A --> B1
-    A --> C1
-    C1 --> B1
-    B1 --> B2
-    B2 --> D1
-    B2 --> R1
-    B2 --> B3
-
-    D1 --> I1
-    I1 --> B3
-    M1 --> B3
-    B3 --> R1
-    B3 --> K1
-    R1 --> K1
-
-    style Entry fill:#f9f,stroke:#333,stroke-width:1px
-    style Core fill:#bbf,stroke:#333,stroke-width:1px
-    style ConfigModule fill:#bfb,stroke:#333,stroke-width:1px
-    style DataModule fill:#bff,stroke:#333,stroke-width:1px
-    style RiskModule fill:#ffb,stroke:#333,stroke-width:1px
-    style Indicators fill:#fbf,stroke:#333,stroke-width:1px
-    style AIModel fill:#ffe,stroke:#333,stroke-width:1px
-    style BrokerAPI fill:#eef,stroke:#333,stroke-width:1px
-```
-    
-### 2. Component Responsibilities
-
-1.  **`main.py`**
-    -   Entry point of the application.\
-    -   Loads `config.json` (via `utils.load_json`) and configures logging.\
-    -   Instantiates `TradingBot(config_dict)` and calls `initialize()` and `run()`.\
-    -   Catches `KeyboardInterrupt` and unexpected exceptions to ensure proper cleanup.
-2.  **`src/config.py`**
-    -   Defines a `Config` class that maps JSON keys (from `config.json`) and environment variables into Python attributes.\
-    -   Attributes include broker credentials, AI API endpoint, symbol list, time zone, capital/risk parameters, and indicator settings.\
-    -   Ensures all numeric values (percentages, intervals) are converted to the correct Python types (`float`, `int`).
-3.  **`src/data_handler.py`**
-    -   **`DataHandler`** class is responsible for:
-        -   **Historical Data Fetching**: `fetch_historical(symbol)` returns a `pandas.DataFrame` of date-indexed OHLCV bars for the last `historical_lookback_days`.
-            -   In production, this should connect to Kiwoom OpenAPI’s historical data TR (transaction requests) or an external data provider (AlphaVantage, IEX, etc.).\
-        -   **Real-time Tick Buffering**: Receives tick events (per second), appends to `real_time_buffer[symbol]`, and once 60 ticks have accumulated, calls `_aggregate_to_minute_bar(symbol)` to produce a 1-minute bar.\
-        -   **Indicator Calculation**: `compute_indicators(symbol)` computes:
-            -   EMA (short/long) via `ta.trend.EMAIndicator`\
-            -   RSI via `ta.momentum.RSIIndicator`\
-            -   Bollinger Bands via `ta.volatility.BollingerBands`\
-            -   VWAP as a cumulative (price × volume) / cumulative volume (minute-by-minute)\
-        -   **Data Caching**: Maintains `historical_data[symbol]` (DataFrame) and `last_timestamp[symbol]`. Enables quick lookup during each loop iteration.
-4.  **`src/risk_manager.py`**
-    -   **`Position`** class holds details for each open position:
-        -   `symbol`, `entry_price`, `quantity`, `stop_loss_price`, `take_profit_price`, and an `is_open` flag.\
-        -   Methods:
-            -   `check_stop_loss(current_price)` returns `True` if `current_price <= stop_loss_price`.\
-            -   `check_take_profit(current_price)` returns `True` if `current_price >= take_profit_price`.\
-    -   **`RiskManager`** class manages:
-        -   `capital`: current account equity (float).\
-        -   `available_cash`: free cash available to open new positions.\
-        -   `positions`: dict mapping `symbol` → `Position` instance (only open positions).\
-        -   `daily_starting_capital`: used to measure daily return/drawdown.\
-    -   Core methods:
-        -   `can_open_position(symbol, price) → bool`:
-            1.  Calculates current invested capital across open positions.\
-            2.  Ensures that `price * 1` does not exceed `capital * max_position_pct`.\
-            3.  Checks whether `(daily_starting_capital − capital) / daily_starting_capital < daily_max_loss_pct / 100`.\
-            4.  Verifies that `price * 1 <= available_cash`.\
-        -   `open_position(symbol, price, quantity)`:
-            1.  Calculates `sl_price = price * (1 − stop_loss_pct/100)`.\
-            2.  Calculates `tp_price = price * (1 + take_profit_pct/100)`.\
-            3.  Creates a new `Position` and deducts `price × quantity` from `available_cash`.\
-        -   `close_position(symbol, exit_price)`:
-            1.  Locates `Position`, calculates `profit = (exit_price − entry_price) × quantity`.\
-            2.  Increments `capital` by `profit`, increments `available_cash` by `exit_price × quantity`.\
-            3.  Marks `Position.is_open = False`.\
-        -   `check_daily_targets() → bool`:
-            1.  Computes `current_return = (capital − daily_starting_capital) / daily_starting_capital`.\
-            2.  If `current_return ≥ target_daily_return_pct/100`, returns `False`.\
-            3.  Computes `current_drawdown = (daily_starting_capital − capital) / daily_starting_capital`.\
-            4.  If `current_drawdown ≥ daily_max_loss_pct/100`, returns `False`.\
-            5.  Otherwise returns `True`.
-5.  **`src/trading_bot.py`**
-    -   **`TradingBot`** orchestrates the entire intraday trading process. Responsibilities:
-        1.  **Initialization** (`initialize()`):
-            -   Calls `data_handler.update_historical_all()` to pre-load historical bars for each symbol.\
-            -   Performs Kiwoom API login (placeholder/TODO).\
-            -   Determines `trading_day` by converting UTC → configured time zone (e.g., `"America/New_York"`) via `pytz`.\
-        2.  **Real-time Tick Retrieval** (`fetch_realtime_ticks()`):
-            -   In production, this logic should be replaced by Kiwoom OpenAPI’s `OnReceiveRealData` callback, which triggers `data_handler.update_realtime(symbol, tick_dict)`.\
-            -   In this template, a daemon thread (`_dummy_tick_feed()`) generates random ticks per second for each symbol.\
-        3.  **Signal Generation** (`generate_signals(symbol)`):
-            -   Retrieves `df = data_handler.compute_indicators(symbol)`.\
-
-            -   Requires at least `max(ema_long_period, rsi_period, bb_period)` rows; otherwise returns `{ "signal": "HOLD" }`.\
-
-            -   Reads latest row (index −1) as `latest`, previous row as `prev`.\
-
-            -   Computes:
-
-                -   **EMA crossover**:
-                    -   `ema_cross_up = prev.ema_short < prev.ema_long && latest.ema_short > latest.ema_long`\
-                    -   `ema_cross_down = prev.ema_short > prev.ema_long && latest.ema_short < latest.ema_long`\
-                -   **RSI signals**:
-                    -   `rsi_oversold = latest.rsi < rsi_oversold`\
-                    -   `rsi_overbought = latest.rsi > rsi_overbought`\
-                -   **Bollinger Breakout**:
-                    -   `bb_break_up = prev.close <= prev.bb_hband && latest.close > latest.bb_hband`\
-                    -   `bb_break_down = prev.close >= prev.bb_lband && latest.close < latest.bb_lband`\
-                -   **VWAP Breakout**:
-                    -   `vwap_break_up = prev.close <= prev.vwap && latest.close > latest.vwap`\
-                    -   `vwap_break_down = prev.close >= prev.vwap && latest.close < latest.vwap`\
-                -   **AI prediction** (placeholder):
-                    -   In production, perform a `POST` to `ai_endpoint` with recent features, read `predicted_return`.\
-                    -   Here: `predicted_return = np.random.uniform(-0.01, +0.01)`.\
-                    -   `ai_buy_signal = predicted_return > 0.005`\
-                    -   `ai_sell_signal = predicted_return < -0.005`\
-
-            -   Combines weighted scores:
-
-                ```         
-                buy_score  = (ema_cross_up ? 1.0 : 0)
-                           + (rsi_oversold ? 0.5 : 0)
-                           + (bb_break_up ? 0.7 : 0)
-                           + (vwap_break_up ? 0.5 : 0)
-                           + (ai_buy_signal ? 1.0 : 0)
-
-                sell_score = (ema_cross_down ? 1.0 : 0)
-                           + (rsi_overbought ? 0.5 : 0)
-                           + (bb_break_down ? 0.7 : 0)
-                           + (vwap_break_down ? 0.5 : 0)
-                           + (ai_sell_signal ? 1.0 : 0)
-                ```
-
-            -   Thresholds (tunable):
-
-                ```         
-                BUY_THRESHOLD  = 1.5
-                SELL_THRESHOLD = 1.5
-                ```
-
-            -   Checks if symbol already has an open position (`has_position = symbol in risk_manager.positions and is_open`).\
-
-            -   **Buy condition**:
-
-                ```         
-                if (buy_score ≥ BUY_THRESHOLD)
-                   and (not has_position)
-                   and risk_manager.can_open_position(symbol, price):
-                       quantity = int((capital * max_position_pct) // price)
-                       if quantity ≥ 1: return { "signal": "BUY", "price": price, "quantity": quantity }
-                ```
-
-            -   **Sell condition**:
-
-                ```         
-                if has_position and (sell_score ≥ SELL_THRESHOLD): return { "signal": "SELL", "price": price, "quantity": 0 }
-                ```
-
-            -   **Stop-loss/Take-profit override**:
-
-                ```         
-                if has_position:
-                  pos = risk_manager.positions[symbol]
-                  if pos.check_stop_loss(price): return { "signal": "SELL_SL", "price": price, "quantity": 0 }
-                  if pos.check_take_profit(price): return { "signal": "SELL_TP", "price": price, "quantity": 0 }
-                ```
-
-            -   Otherwise: `{ "signal": "HOLD" }`.\
-        4.  **Order Execution** (`execute_order(signal, symbol)`):
-            -   Reads `signal_type = signal["signal"]`.\
-            -   If `"BUY"`, calls `risk_manager.open_position(symbol, price, quantity)` (replace with actual `kiwoom.send_order`).\
-            -   If `"SELL"`, `"SELL_SL"`, or `"SELL_TP"`, calls `risk_manager.close_position(symbol, price)` (replace with actual `kiwoom.send_order`).\
-            -   All actual API calls (Kiwoom) are marked as `TODO`.\
-        5.  **Main Running Loop** (`run()`):
-            -   Calls `fetch_realtime_ticks()` (starts dummy thread or sets up real callback).\
-
-            -   Enters `while True` loop:
-
-                ```         
-                now_utc = datetime.utcnow()
-                if not is_market_open(now_utc):
-                    sleep(60)  # Re-check after 1 minute
-                    continue
-
-                for symbol in config.symbols:
-                    df = data_handler.historical_data[symbol]
-                    if df.empty: continue
-                    signal = generate_signals(symbol)
-                    if signal["signal"] ≠ "HOLD":
-                        execute_order(signal, symbol)
-
-                if not risk_manager.check_daily_targets():
-                    break  # Stop new entries, then finalize
-
-                sleep(loop_interval_sec)
-                ```
-
-            -   After loop (either market closed or daily target reached), calls `_final_cleanup()` to close all open positions at last available price.\
-        6.  **Market Open Check** (`is_market_open(now_utc)`)
-            -   Converts `now_utc` to hours/minutes; for simplicity assumes UTC 14:30–21:00 = NYSE open (does not account for daylight savings).\
-            -   In production, use `pytz` or a market-calendar library (e.g., `pandas_market_calendars`) to accurately detect open/close times including holidays.\
-        7.  **Final Cleanup** (`_final_cleanup()`)
-            -   Iterates through `risk_manager.positions`, and for each `pos.is_open == True`, retrieves `last_price = data_handler.historical_data[symbol].close.iloc[-1]` and calls `risk_manager.close_position(symbol, last_price)`.
-6.  **`src/utils.py`**
-    -   Provides helper functions that are used across modules:
-        -   `load_json(path) → dict`: Safely opens a file, parses JSON, returns a `dict`.\
-        -   `save_log(message, log_file)`: Appends `timestamp + message` to a text log.\
-        -   `ensure_dir(directory)`: Creates a directory (and parents) if it does not already exist.
-
-------------------------------------------------------------------------
-
-## 3. Data Flow and Interactions
-
-1.  **Application Start**
-    -   `main.py` reads `config.json` → instantiates `TradingBot(config_dict)` → calls `initialize()`.\
-    -   `initialize()` calls `data_handler.update_historical_all()` to preload historical bars and then logs in to Kiwoom.
-2.  **Real-Time Tick Loop**
-    -   Real tick events arrive via Kiwoom OpenAPI callbacks (or dummy thread). Each tick is a structure:
-
-        ``` jsonc
-        {
-          "datetime": "2025-06-05T13:00:00.123Z",
-          "price": 128.45,
-          "volume": 50
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TradingBot Config",
+  "type": "object",
+  "properties": {
+    "mode": {"type": "string", "enum": ["live", "backtest"]},
+    "symbols": {"type": "array", "items": {"type": "string"}},
+    "time_zone": {"type": "string", "description": "IANA time zone name, e.g., 'America/New_York'"},
+    "broker": {
+      "type": "object",
+      "properties": {
+        "api_type": {"type": "string", "enum": ["kiwoom", "other"]},
+        "credentials": {
+          "type": "object",
+          "properties": {
+            "account_id": {"type": "string"},
+            "access_token": {"type": "string"}
+          },
+          "required": ["account_id", "access_token"]
         }
-        ```
+      },
+      "required": ["api_type", "credentials"]
+    },
+    "risk_params": {
+      "type": "object",
+      "properties": {
+        "max_position_pct": {"type": "number", "minimum": 0, "maximum": 1},
+        "daily_max_loss_pct": {"type": "number", "minimum": 0, "maximum": 1},
+        "daily_target_pct": {"type": "number", "minimum": 0, "maximum": 1}
+      },
+      "required": ["max_position_pct", "daily_max_loss_pct", "daily_target_pct"]
+    },
+    "indicator_params": {
+      "type": "object",
+      "properties": {
+        "ema_short_period": {"type": "integer", "minimum": 1},
+        "ema_long_period": {"type": "integer", "minimum": 1},
+        "rsi_period": {"type": "integer", "minimum": 1},
+        "rsi_oversold": {"type": "number", "minimum": 0, "maximum": 100},
+        "rsi_overbought": {"type": "number", "minimum": 0, "maximum": 100},
+        "bb_period": {"type": "integer", "minimum": 1},
+        "bb_dev": {"type": "number", "minimum": 0}
+      },
+      "required": ["ema_short_period", "ema_long_period", "rsi_period", "rsi_oversold", "rsi_overbought", "bb_period", "bb_dev"]
+    },
+    "ai_model": {
+      "type": "object",
+      "properties": {
+        "endpoint_url": {"type": "string", "format": "uri"},
+        "headers": {"type": "object", "additionalProperties": {"type": "string"}}
+      },
+      "required": ["endpoint_url"]
+    },
+    "logging": {
+      "type": "object",
+      "properties": {
+        "log_file_path": {"type": "string"},
+        "log_level": {"type": "string", "enum": ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]}
+      },
+      "required": ["log_file_path", "log_level"]
+    }
+  },
+  "required": ["mode", "symbols", "time_zone", "broker", "risk_params", "indicator_params", "ai_model", "logging"]
+}
 
-    -   For each tick, `data_handler.update_realtime(symbol, tick)` appends to `real_time_buffer[symbol]`. Once 60 ticks are collected, `_aggregate_to_minute_bar(symbol)` aggregates into a 1-minute bar which is appended to `historical_data[symbol]`.
-3.  **Indicator Calculation**
-    -   On each loop iteration, for each symbol:
-        -   `TradingBot.generate_signals(symbol)` calls `data_handler.compute_indicators(symbol)`.\
-        -   `compute_indicators` recalculates EMA, RSI, Bollinger, VWAP on the up-to-date DataFrame.
-4.  **Signal Generation & Order Execution**
-    -   `generate_signals` returns a `{"signal": X, "price": P, "quantity": Q}` dictionary.\
-    -   `execute_order` interprets that dictionary, updates account/position state in `risk_manager`, and (in production) would submit orders via Kiwoom API.
-5.  **Risk Management**
-    -   Every cycle, after orders (if any), `TradingBot.run()` calls `risk_manager.check_daily_targets()`.\
-    -   If daily profit ≥ target or drawdown ≥ limit, new entries are blocked and loop ends.
-6.  **Final Cleanup**
-    -   Once main loop exits, `TradingBot._final_cleanup()` force-closes all open positions at the last known close price.
+Example config.json
 
-------------------------------------------------------------------------
+{
+  "mode": "live",
+  "symbols": ["AAPL", "MSFT", "GOOG"],
+  "time_zone": "America/New_York",
+  "broker": {"api_type": "kiwoom", "credentials": {"account_id": "ABC123", "access_token": "XYZ456"}},
+  "risk_params": {"max_position_pct": 0.10, "daily_max_loss_pct": 0.05, "daily_target_pct": 0.02},
+  "indicator_params": {"ema_short_period": 12, "ema_long_period": 26, "rsi_period": 14, "rsi_oversold": 30.0, "rsi_overbought": 70.0, "bb_period": 20, "bb_dev": 2.0},
+  "ai_model": {"endpoint_url": "https://api.example.com/predict", "headers": {"Authorization": "Bearer TOKEN"}},
+  "logging": {"log_file_path": "logs/bot.log", "log_level": "INFO"}
+}
 
-## 4. Deployment & Execution Environment
 
-1.  **Dependencies**
-    -   Python 3.8 or higher\
+⸻
 
-    -   Required packages (in `requirements.txt`):
+3. MODULE INTERFACES (Python Signatures & Types)
 
-        ```         
-        pandas>=1.3.0
-        numpy>=1.21.0
-        ta>=0.8.0
-        pytz>=2021.3
-        requests>=2.26.0
-        python-dotenv>=0.19.0
-        PyKiwoom>=1.4.4
-        pytest>=6.2.0
-        ```
+3.1. Config (src/config.py)
 
-    -   Kiwoom OpenAPI (HTS) installed locally, with proper digital certificate set.
-2.  **Configuration**
-    -   `config.json` holds all environment-specific settings: broker credentials, symbols, risk parameters, indicator parameters, API endpoints, logging locations.\
-    -   Sensitive values (passwords, API keys) may be overridden by environment variables (via `python-dotenv` and a `.env` file).
-3.  **Logging**
-    -   Logs written to `logs/bot.log` (rotating logs or log rollover can be added).\
-    -   `log_level` configured in `config.json`; typically `"INFO"` or `"DEBUG"`.
-4.  **Backtesting vs. Live Trading**
-    -   The same codebase can run in **live mode** (real ticks, real API orders) or **backtest mode** (historical CSV data, no real orders).\
-    -   To support backtesting, you would:
-        1.  Populate `data/historical/` with one or more CSV/Parquet files named `{SYMBOL}_1min.csv`.\
-        2.  Modify or extend `TradingBot.run()` to iterate over historical timestamps instead of real clock, feeding `DataHandler` one bar at a time.\
-        3.  Disable actual `execute_order` API calls and instead record simulated P&L.
-5.  **Scalability Considerations**
-    -   For a small list of symbols (≤ 10), a single process is sufficient.\
-    -   For hundreds of symbols or ultra-high-frequency ticks, consider:
-        -   Asynchronous I/O (e.g., `asyncio`), nonblocking HTTP calls for AI model.\
-        -   External queue/broker (Redis, Kafka) to buffer ticks.\
-        -   Horizontal scaling: run multiple bots on different symbol subsets.\
-    -   Use a database (PostgreSQL, InfluxDB) to store historical ticks/indicators if persistence or large-scale analytics is required.
+from typing import List, Dict, Any
 
-------------------------------------------------------------------------
+class Config:
+    def __init__(self, config_dict: Dict[str, Any]) -> None:
+        self.mode: str  # 'live' or 'backtest'
+        self.symbols: List[str]
+        self.time_zone: str
+        self.broker_api_type: str
+        self.broker_credentials: Dict[str, str]
+        self.max_position_pct: float
+        self.daily_max_loss_pct: float
+        self.daily_target_pct: float
+        self.ema_short_period: int
+        self.ema_long_period: int
+        self.rsi_period: int
+        self.rsi_oversold: float
+        self.rsi_overbought: float
+        self.bb_period: int
+        self.bb_dev: float
+        self.ai_endpoint: str
+        self.ai_headers: Dict[str, str]
+        self.log_file_path: str
+        self.log_level: str
+        # Internal validation: raise ValueError if missing keys or type mismatch
+    
+    @staticmethod
+    def from_json(path: str) -> 'Config':
+        """Parses config.json, returns Config instance."""
 
-## 5. Future Enhancements
+3.2. DataHandler (src/data_handler.py)
 
-1.  **Accurate Market Calendar**
-    -   Replace the simplified `is_market_open` logic with a robust market-calendar library (e.g., `pandas_market_calendars`) to handle holidays, half-days, daylight-savings.
-2.  **Modular AI Integration**
-    -   Extract AI model code into a separate `ai_model.py` module.\
-    -   Implement streaming or batch predictions (e.g., gRPC, WebSockets for sub-second latency).\
-    -   Allow multiple AI models (LSTM, Transformer, RL) and dynamically select or ensemble outputs.
-3.  **Order Execution Resilience**
-    -   Add retry logic in `execute_order` for network timeouts or API rate limits.\
-    -   Monitor for partial fills, slippage, and adjust `quantity` or price accordingly.
-4.  **Metric Dashboards**
-    -   Expose a simple web dashboard (Flask/Streamlit) to display:
-        -   Real-time P&L, current positions, indicator charts per symbol.\
-        -   Daily/weekly performance metrics, drawdown, Sharpe ratio.
-5.  **Containerization & CI/CD**
-    -   Create a `Dockerfile` that installs dependencies and runs `main.py`.\
-    -   Use GitHub Actions (or GitLab CI) to run `pytest` on every push/PR.\
-    -   Automate builds and deployments to a cloud VM or Kubernetes cluster.
+import pandas as pd
+from typing import Dict, Any
 
-------------------------------------------------------------------------
+class DataHandler:
+    historical_data: Dict[str, pd.DataFrame]   # symbol -> DataFrame
+    real_time_buffer: Dict[str, list[Dict[str, Any]]]  # symbol -> list of ticks
 
-## 6. Summary
+    def __init__(self, symbols: list[str], lookback_days: int) -> None:
+        """Initialize empty buffers and load historical CSV if backtest mode."""
 
--   The `docs/architecture.md` file outlines each module’s role, data flow diagrams, and interactions.\
--   It also highlights how historical data and real-time ticks feed into indicator calculation, which in turn drives signal generation.\
--   The `TradingBot` class is the orchestrator that ties together data ingestion, indicator computation, decision logic, order execution, and risk enforcement.
+    def fetch_historical(self, symbol: str) -> pd.DataFrame:
+        """Returns DataFrame with OHLCV bars for last lookback_days."""
 
-With this architecture, you have a clear separation of concerns that facilitates maintainability, extensibility, and robust intraday trading operations.
+    def update_historical_all(self) -> None:
+        """Load historical for all symbols; store in self.historical_data."""
+
+    def update_realtime(self, symbol: str, tick: Dict[str, Any]) -> None:
+        """Append tick to buffer; every 60 ticks → aggregate to minute bar."""
+
+    def _aggregate_to_minute_bar(self, symbol: str) -> None:
+        """Converts buffered ticks into one OHLCV row, appends to historical_data."""
+
+    def compute_indicators(self, symbol: str) -> pd.DataFrame:
+        """Given DataFrame self.historical_data[symbol], returns with added columns: ema_short, ema_long, rsi, bb_hband, bb_lband, vwap."""
+
+3.3. RiskManager (src/risk_manager.py)
+
+from typing import Dict, Any, Optional
+
+class Position:
+    symbol: str
+    entry_price: float
+    quantity: int
+    stop_loss: float
+    take_profit: float
+    is_open: bool
+
+    def __init__(self, symbol: str, entry_price: float, quantity: int, stop_loss: float, take_profit: float) -> None:
+        self.symbol = symbol
+        self.entry_price = entry_price
+        self.quantity = quantity
+        self.stop_loss = stop_loss
+        self.take_profit = take_profit
+        self.is_open = True
+
+    def check_stop_loss(self, price: float) -> bool:
+        return price <= self.stop_loss
+
+    def check_take_profit(self, price: float) -> bool:
+        return price >= self.take_profit
+
+class RiskManager:
+    def __init__(self, starting_capital: float, max_position_pct: float, daily_max_loss_pct: float, daily_target_pct: float) -> None:
+        self.capital: float = starting_capital
+        self.available_cash: float = starting_capital
+        self.positions: Dict[str, Position] = {}
+        self.daily_starting_capital: float = starting_capital
+        self.max_position_pct: float = max_position_pct
+        self.daily_max_loss_pct: float = daily_max_loss_pct
+        self.daily_target_pct: float = daily_target_pct
+
+    def can_open_position(self, symbol: str, price: float) -> bool:
+        """Checks cash, position sizing, and drawdown constraints."""
+        invested = sum(pos.entry_price * pos.quantity for pos in self.positions.values() if pos.is_open)
+        if (price * 1) > (self.capital * self.max_position_pct):
+            return False
+        if (price * 1) > self.available_cash:
+            return False
+        drawdown = (self.daily_starting_capital - self.capital) / self.daily_starting_capital
+        if drawdown >= self.daily_max_loss_pct:
+            return False
+        return True
+
+    def open_position(self, symbol: str, price: float, quantity: int) -> None:
+        """Creates Position, deducts capital and cash."""
+        sl = price * (1 - self.daily_max_loss_pct)
+        tp = price * (1 + self.daily_target_pct)
+        self.positions[symbol] = Position(symbol, price, quantity, sl, tp)
+        self.available_cash -= price * quantity
+
+    def close_position(self, symbol: str, exit_price: float) -> Optional[float]:
+        """Closes existing position, returns P&L or None if no position."""
+        pos = self.positions.get(symbol)
+        if not pos or not pos.is_open:
+            return None
+        profit = (exit_price - pos.entry_price) * pos.quantity
+        self.capital += profit
+        self.available_cash += exit_price * pos.quantity
+        pos.is_open = False
+        return profit
+
+    def check_daily_targets(self) -> bool:
+        """Returns True to continue trading; False to stop."""
+        ret = (self.capital - self.daily_starting_capital) / self.daily_starting_capital
+        if ret >= self.daily_target_pct:
+            return False
+        drawdown = (self.daily_starting_capital - self.capital) / self.daily_starting_capital
+        if drawdown >= self.daily_max_loss_pct:
+            return False
+        return True
+
+3.4. TradingBot (src/trading_bot.py)
+
+from typing import Dict, Any
+from datetime import datetime, timezone
+
+class TradingBot:
+    def __init__(self, config: Config, data_handler: DataHandler, risk_manager: RiskManager) -> None:
+        self.config = config
+        self.data_handler = data_handler
+        self.risk_manager = risk_manager
+        self.trading_day = None
+
+    def initialize(self) -> None:
+        """Load historical data, login broker, compute trading day."""
+        self.data_handler.update_historical_all()
+        self._login_broker()
+        self._set_trading_day()
+
+    def _login_broker(self) -> None:
+        """Placeholder for Kiwoом or other API login."""
+        pass
+
+    def _set_trading_day(self) -> None:
+        """Compute current trading day based on config.time_zone."""
+        now_utc = datetime.now(timezone.utc)
+        # Convert to config.time_zone via pytz (omitted for brevity)
+        self.trading_day = now_utc.date()
+
+    def fetch_realtime_ticks(self) -> None:
+        """Starts tick listener (real or dummy)."""
+        # In live: subscribe to Kiwoom OnReceiveRealData callback
+        # In backtest: skip
+        pass
+
+    def generate_signals(self, symbol: str) -> Dict[str, Any]:
+        """Compute indicators, fetch AI, and combine rule-based signals."""
+        df = self.data_handler.compute_indicators(symbol)
+        if df.shape[0] < max(self.config.ema_long_period, self.config.rsi_period, self.config.bb_period):
+            return {"signal": "HOLD", "price": None, "quantity": 0}
+        prev = df.iloc[-2]
+        latest = df.iloc[-1]
+        price = latest.close
+
+        # Rule-based signals
+        ema_up = prev.ema_short < prev.ema_long and latest.ema_short > latest.ema_long
+        ema_down = prev.ema_short > prev.ema_long and latest.ema_short < latest.ema_long
+        rsi_low = latest.rsi < self.config.rsi_oversold
+        rsi_high = latest.rsi > self.config.rsi_overbought
+        bb_up = prev.close <= prev.bb_hband and latest.close > latest.bb_hband
+        bb_down = prev.close >= prev.bb_lband and latest.close < latest.bb_lband
+        vwap_up = prev.close <= prev.vwap and latest.close > latest.vwap
+        vwap_down = prev.close >= prev.vwap and latest.close < latest.vwap
+
+        # AI signal
+        ai_pred = self._ai_predict(symbol, df.tail(self.config.ema_long_period * 2))
+        ai_buy = ai_pred > 0.005
+        ai_sell = ai_pred < -0.005
+
+        buy_score = sum([ema_up, rsi_low, bb_up, vwap_up, ai_buy])
+        sell_score = sum([ema_down, rsi_high, bb_down, vwap_down, ai_sell])
+
+        has_pos = symbol in self.risk_manager.positions and self.risk_manager.positions[symbol].is_open
+        if buy_score >= 1.5 and not has_pos and self.risk_manager.can_open_position(symbol, price):
+            qty = int((self.risk_manager.capital * self.config.max_position_pct) // price)
+            if qty >= 1:
+                return {"signal": "BUY", "price": price, "quantity": qty}
+        if has_pos and sell_score >= 1.5:
+            return {"signal": "SELL", "price": price, "quantity": 0}
+        # Stop-loss / take-profit override
+        if has_pos:
+            pos = self.risk_manager.positions[symbol]
+            if pos.check_stop_loss(price):
+                return {"signal": "SELL_SL", "price": price, "quantity": 0}
+            if pos.check_take_profit(price):
+                return {"signal": "SELL_TP", "price": price, "quantity": 0}
+        return {"signal": "HOLD", "price": price, "quantity": 0}
+
+    def _ai_predict(self, symbol: str, df: Any) -> float:
+        """Sends HTTP POST to AI endpoint, returns predicted_return."""
+        # example:
+        # payload = df.to_dict(orient='list')
+        # resp = requests.post(self.config.ai_endpoint, headers=self.config.ai_headers, json=payload)
+        # return resp.json().get('predicted_return', 0.0)
+        return 0.0  # placeholder
+
+    def execute_order(self, signal_dict: Dict[str, Any]) -> None:
+        """Interprets signal and calls RiskManager and BrokerAPI."""
+        sig = signal_dict.get("signal")
+        sym = signal_dict.get("symbol")
+        price = signal_dict.get("price")
+        qty = signal_dict.get("quantity")
+        if sig == "BUY":
+            self.risk_manager.open_position(sym, price, qty)
+            # BrokerAPI.send_order('BUY', sym, price, qty)
+        elif sig in ["SELL", "SELL_SL", "SELL_TP"]:
+            profit = self.risk_manager.close_position(sym, price)
+            # BrokerAPI.send_order('SELL', sym, price, qty=0)
+        # else HOLD: do nothing
+
+    def run(self) -> None:
+        """Main loop: fetch ticks, generate & execute signals, check risk."""
+        self.fetch_realtime_ticks()
+        while True:
+            if not self._market_open():
+                time.sleep(60)
+                continue
+            for symbol in self.config.symbols:
+                sig = self.generate_signals(symbol)
+                if sig['signal'] != 'HOLD':
+                    self.execute_order({**sig, 'symbol': symbol})
+            if not self.risk_manager.check_daily_targets():
+                break
+            time.sleep(1)
+        self._final_cleanup()
+
+    def _market_open(self) -> bool:
+        """Return True if current UTC time is within market hours."""
+        now = datetime.now(timezone.utc)
+        # Simplified window; replace with real calendar check
+        return True
+
+    def _final_cleanup(self) -> None:
+        """Force-close all open positions at last close."""
+        for symbol, pos in self.risk_manager.positions.items():
+            if pos.is_open:
+                price = self.data_handler.historical_data[symbol].iloc[-1].close
+                self.risk_manager.close_position(symbol, price)
+
+
+⸻
+
+4. ORDER SCHEMA & CONTRACTS (OpenAPI / Internal)
+
+4.1. Order Data Model
+
+{
+  "type": "object",
+  "properties": {
+    "symbol": {"type": "string"},
+    "direction": {"type": "string", "enum": ["BUY", "SELL"]},
+    "price": {"type": "number"},
+    "quantity": {"type": "integer"},
+    "order_type": {"type": "string", "enum": ["MARKET", "LIMIT"]},
+    "timestamp": {"type": "string", "format": "date-time"}
+  },
+  "required": ["symbol", "direction", "price", "quantity", "order_type", "timestamp"]
+}
+
+4.2. BrokerAPI Interface (Kiwoom)
+
+class BrokerAPI:
+    def send_order(self, order: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Sends order to broker. Input == Order data model. 
+        Returns execution_report: {"order_id": str, "filled_qty": int, "avg_price": float, "status": str}
+        """
+
+
+⸻
+
+5. BACKTEST MODE SPECIFICS
+
+class BacktestRunner:
+    def __init__(self, data_folder: str, config: Config):
+        self.data_folder = data_folder
+        self.config = config
+        self.data_handler = DataHandler(config.symbols, lookback_days=365)
+        self.risk_manager = RiskManager(config.starting_capital, config.max_position_pct, config.daily_max_loss_pct, config.daily_target_pct)
+        self.trading_bot = TradingBot(config, self.data_handler, self.risk_manager)
+
+    def run_backtest(self) -> Dict[str, Any]:
+        """Iterate historical CSV bars instead of real ticks."""
+        for symbol in self.config.symbols:
+            df = pd.read_csv(f"{self.data_folder}/{symbol}_1min.csv", parse_dates=["datetime"])
+            for idx, row in df.iterrows():
+                self.data_handler.historical_data[symbol].append(row)
+                self.trading_bot.generate_signals(symbol)
+                self.trading_bot.execute_order(...)  # adjust logic
+        return {"final_capital": self.risk_manager.capital, "positions": self.risk_manager.positions}
+
+
+⸻
+
+6. EXTENSION & REFRACTION POINTS
+	1.	New Indicator Modules: Add a class in src/indicators.py with:
+
+class IndicatorBase:
+    def compute(self, df: pd.DataFrame) -> pd.DataFrame:
+        pass
+
+	•	Integrate by calling indicator.compute(df) inside DataHandler.compute_indicators.
+
+	2.	Alternative AI Model: Replace _ai_predict with streaming gRPC client:
+
+class AIClientGRPC:
+    def predict(self, features: Any) -> float:
+        """Streams features to ML model and returns prediction."""
+
+	•	Swap in config by adding ai_type: "rest" or "grpc".
+
+	3.	Custom Risk Rules: Subclass RiskManager:
+
+class CustomRiskManager(RiskManager):
+    def can_open_position(self, symbol: str, price: float) -> bool:
+        # override with volatility-based sizing
+        return super().can_open_position(symbol, price)
+
+
+	4.	Dynamic Symbol List: Implement a SymbolManager to fetch tickers from external source:
+
+class SymbolManager:
+    def fetch_symbols(self) -> list[str]:
+        # e.g., from CSV, API, database
+        return [...]  
+
+	•	TradingBot should call SymbolManager.fetch_symbols() on startup or periodically.
+
+	5.	Plugin Hooks in TradingBot.run():
+
+class TradingBot:
+    def before_loop(self): pass
+    def after_loop(self): pass
+    def before_signal(self, symbol: str): pass
+    def after_signal(self, symbol: str, signal: Dict[str, Any]): pass
+
+	•	Allows dynamic logic injection without editing core code.
+
+⸻
+
+7. DEPLOYMENT & INFRASTRUCTURE
+
+7.1. Environment Setup (Live)
+
+# Python version
+python == 3.9.0
+pip install -r requirements.txt
+# Kiwoom HTS must be installed with digital certificate, COM components available
+export KIWOOM_CERT_PATH="/path/to/cert"
+export API_KEY="abc123"
+
+7.2. Containerization
+
+Dockerfile:
+
+FROM python:3.9-slim
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . /app
+CMD ["python", "main.py"]
+
+7.3. CI/CD (GitHub Actions)
+
+name: CI
+on: [push, pull_request]
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Setup Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: 3.9
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+      - name: Run Tests
+        run: pytest --maxfail=1 --disable-warnings -q
+
+
+⸻
+
+8. DIAGRAM (Concise ASCII for AI Parsing)
+
+[main.py] -> [Config] -> [TradingBot] -> [DataHandler]
+                                  -> [RiskManager]
+                                  -> [AIClient]
+                                  -> [BrokerAPI]
+
+	•	Arrows indicate data/control flow.
+	•	Node labels correspond to class or module names.
+
+⸻
+
+9. SUMMARY FOR AI AGENT
+	1.	Config: Validates and exposes all runtime parameters.
+	2.	DataHandler: Manages tick ingestion, bar aggregation, indicator computation.
+	3.	RiskManager: Tracks capital, positions, enforces risk logic.
+	4.	TradingBot: Controls main loop, combines technical and AI signals, implements plugin hooks.
+	5.	AI Integration: Configurable via REST or gRPC client.
+	6.	Broker API: Abstracted interface, stubbed for Kiwoom.
+	7.	BacktestRunner: Emulates live loop using historical CSVs.
+	8.	Extension Points: Modular indicator, AI, risk, symbol manager, plugin hooks.
+
+⸻
+
+AI Agent Guidance: Use this specification to generate or modify code. Each module has explicit signatures and types. Backtests, live mode, and deployment workflows are fully described. Extension points are annotated for seamless integration. Ensure new code aligns with the data schemas and interface contracts provided above.
