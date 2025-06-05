@@ -49,8 +49,8 @@ This document provides step-by-step instructions for installing, configuring, an
 1.  **Clone the Repository**
     Replace the URL below with your own repository’s URL:
     ```bash
-    git clone https://github.com/<your-username>/<your-repo-name>.git
-    cd <your-repo-name>
+    git clone https://github.com/Jo-1n/project_bongni.git
+    cd project_bongni
     ```
 
 2.  **Activate Virtual Environment**
