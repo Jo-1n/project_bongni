@@ -37,44 +37,44 @@ Below is a high-level Mermaid flowchart of major components and data flows. You 
 flowchart TD
     subgraph Entry[ ]
         direction TB
-        A[main.py\n• Load config.json\n• Initialize TradingBot\n• Configure logging]
+        A[main.py\n- Load config.json\n- Initialize TradingBot\n- Configure logging]
     end
 
     subgraph Core[TradingBot]
         direction TB
-        B1[initialize()\n• DataHandler.update_historical_all()\n• Kiwoom API login (TODO)\n• Determine trading_day]
-        B2[fetch_realtime_ticks()\n• Start dummy thread or real API callback\n• DataHandler.update_realtime()]
-        B3[run() Loop\n• For each symbol →\n  – DataHandler.compute_indicators()\n  – generate_signals()\n  – execute_order()\n• RiskManager.check_daily_targets()\n  – On limit reached, call _final_cleanup()]
+        B1[initialize()\n- update_historical_all()\n- Kiwoom API login (TODO)\n- Determine trading_day]
+        B2[fetch_realtime_ticks()\n- Start dummy thread or real API callback\n- update_realtime()]
+        B3[run() Loop\n- For each symbol:\n  - compute_indicators()\n  - generate_signals()\n  - execute_order()\n- check_daily_targets()\n  - If limit reached: _final_cleanup()]
     end
 
     subgraph ConfigModule[src/config.py]
         direction TB
-        C1[Config\n• Map config.json → Python attributes\n(broker credentials, symbols, risk params, indicator settings, API URLs)]
+        C1[Config\n- Parse config.json\n- Set broker credentials, symbols, risk params, indicator settings, API URLs]
     end
 
     subgraph DataModule[src/data_handler.py]
         direction TB
-        D1[DataHandler\n• fetch_historical(symbol)\n  – Load N days of 1-min OHLCV (Dummy or API)\n• update_historical_all()\n• update_realtime(symbol, tick)\n  – Buffer ticks, every 60 → _aggregate_to_minute_bar()\n• compute_indicators(symbol)\n  – Calculate EMA, RSI, Bollinger Bands, VWAP]
+        D1[DataHandler\n- fetch_historical(symbol)\n- update_historical_all()\n- update_realtime(symbol, tick)\n- compute_indicators(symbol)]
     end
 
     subgraph RiskModule[src/risk_manager.py]
         direction TB
-        R1[RiskManager\n• Track capital, available_cash, daily_starting_capital\n• can_open_position(symbol, price)\n  – Check position sizing, daily drawdown, cash\n• open_position(symbol, price, qty)\n  – Set SL/TP, update cash\n• close_position(symbol, exit_price)\n  – Compute P&L, update capital & cash\n• check_daily_targets()\n  – Compare return & drawdown to limits]
+        R1[RiskManager\n- Track capital, available cash\n- can_open_position(symbol, price)\n- open_position(symbol, price, qty)\n- close_position(symbol, exit_price)\n- check_daily_targets()]
     end
 
     subgraph Indicators[Technical Indicators]
         direction TB
-        I1[EMA, RSI, Bollinger Bands, VWAP\nvia `ta` library]
+        I1[EMA, RSI, Bollinger Bands, VWAP\n(via ta-lib)]
     end
 
     subgraph AIModel[External AI Model | REST API]
         direction TB
-        M1[AI Prediction Endpoint\n• Returns predicted_return\n• Derive ai_buy_signal / ai_sell_signal]
+        M1[AI Prediction Endpoint\n- Return predicted_return\n- Derive buy/sell signal]
     end
 
     subgraph BrokerAPI[Broker API (Kiwoom OpenAPI)]
         direction TB
-        K1[send_order()\n• Actual BUY/SELL order submission\n• Return execution report (TODO)]
+        K1[send_order()\n- Submit BUY/SELL order\n- Return execution report (TODO)]
     end
 
     %% Connections
