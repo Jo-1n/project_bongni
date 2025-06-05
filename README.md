@@ -1,8 +1,3 @@
-네, 알겠습니다. 이전 논의를 바탕으로 사용자 경험을 개선한 `README.md` 파일의 내용을 수정하여 제안해 드립니다.
-
-핵심은 **간결함, 명확한 첫인상, 그리고 상세 정보로의 쉬운 안내**입니다.
-
-```markdown
 # Trading Bot Repository
 
 This project implements a modular, AI‐optimized trading bot that can operate in both backtest and live modes using the Kiwoom OpenAPI (on Windows).
